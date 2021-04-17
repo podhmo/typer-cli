@@ -301,6 +301,135 @@ def docs(
         typer.echo(clean_docs)
 
 
+@utils_app.command()
+def init(
+    ctx: typer.Context,
+    *,
+    inplace: bool = False,
+) -> None:
+    """
+    initialize Typer
+    """
+    from typing import Union
+    import textwrap
+    from lib2to3 import pytree
+    from lib2to3 import pygram
+    from lib2to3.pgen2 import driver
+    from lib2to3.pgen2 import token
+    from lib2to3.pgen2.parse import ParseError
+
+    Node = Union[pytree.Node, pytree.Leaf]
+
+    def node_name(node: Node) -> str:
+        # Nodes with values < 256 are tokens. Values >= 256 are grammar symbols.
+        if node.type < 256:
+            return token.tok_name[node.type]
+        else:
+            return pygram.python_grammar.number2symbol[node.type]
+
+    class PyTreeVisitor:
+        def __init__(self):
+            self.import_typer_inserted = False
+            self.seen = set()
+
+        def visit(self, node: Node) -> None:
+            method = "visit_{0}".format(node_name(node))
+            if hasattr(self, method):
+                # Found a specific visitor for this node
+                if getattr(self, method)(node):
+                    return
+
+            self.default_node_visit(node)  # type: ignore
+
+        def default_node_visit(self, node: pytree.Node) -> None:
+            for child in node.children:
+                self.visit(child)
+
+        def visit_decorator(self, node: Node) -> None:
+            this = node
+            while True:
+                this = this.next_sibling
+                token = node_name(this)
+                if token == "classdef":
+                    return
+                if token == "funcdef":
+                    break
+
+            k = id(this)
+            if k in self.seen:
+                return
+
+            self.seen.add(k)
+            if not self.import_typer_inserted:
+                self.import_typer_inserted = True
+                prefix = textwrap.dedent(
+                    f"""\
+                import typer
+
+                app = typer.Typer(help="Awesome CLI")
+
+
+                {prefix}"""
+                )
+
+            node.prefix = f"{node.prefix}@app.command()\n"
+
+        def visit_funcdef(self, node: Node) -> None:
+            k = id(node)
+            if k in self.seen:
+                return
+
+            self.seen.add(k)
+            prefix = f"{node.prefix}@app.command()\n"
+
+            if not self.import_typer_inserted:
+                self.import_typer_inserted = True
+                prefix = textwrap.dedent(
+                    f"""\
+                import typer
+
+                app = typer.Typer(help="Awesome CLI")
+
+
+                {prefix}"""
+                )
+
+            node.prefix = prefix
+
+    module_name = "_type_cli__init_main"
+    spec = importlib.util.spec_from_file_location(module_name, state.file)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+
+    public_functions = []
+    for name, val in module.__dict__.items():
+        if name.startswith("_"):
+            continue
+        if not callable(val):
+            continue
+        if getattr(val, "__module__", None) != module.__name__:
+            continue
+        if hasattr(val, "mro"):
+            continue
+        public_functions.append(val)
+
+    driver = driver.Driver(
+        pygram.python_grammar_no_print_statement, convert=pytree.convert
+    )
+    t = driver.parse_file(state.file, debug=True)
+    PyTreeVisitor().visit(t)
+    print(t)
+    print(
+        textwrap.dedent(
+            """
+    if __name__ == "__main__":
+        app()
+"""
+        )
+    )
+
+
 def main() -> Any:
     click._bashcomplete.get_choices = get_choices
     return app()
